@@ -1,0 +1,20 @@
+# 加密价差套利系统 - Docker 编排
+# 用法:
+#   docker compose -f docker/docker-compose.yml up --build
+# 修改运行模式:在 .env 中设置 ARB_MODE=monitor|backtest|paper|live|cross
+# 或运行时覆盖:docker compose run --rm arb --mode paper
+services:
+  arb:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    env_file:
+      - ../.env
+    volumes:
+      # 持久化 SQLite 落库与配置
+      - ../arb/config/symbols.yaml:/app/arb/config/symbols.yaml:ro
+      - arb-data:/app
+    restart: unless-stopped
+
+volumes:
+  arb-data:

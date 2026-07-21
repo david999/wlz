@@ -1,0 +1,16 @@
+# 密钥与本地配置
+.env
+
+# 数据库落库文件
+*.db
+*.db-journal
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+build/
+dist/

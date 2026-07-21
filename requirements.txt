@@ -1,0 +1,12 @@
+# 迭代 1 依赖:仅只读价差监控所需
+ccxt>=4.4.0            # 统一交易所 API,内置 ccxt.pro(WebSocket)
+pydantic>=2.7
+pydantic-settings>=2.3
+aiosqlite>=0.20
+PyYAML>=6.0
+python-dotenv>=1.0
+structlog>=24.1
+
+# 测试
+pytest>=8.0
+pytest-asyncio>=0.23

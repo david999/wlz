@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "arb"
+version = "0.1.0"
+description = "Delta-neutral crypto spread arbitrage system (Iteration 1: read-only spread monitor)"
+requires-python = ">=3.11"
+
+[tool.setuptools]
+packages = ["arb"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+asyncio_mode = "auto"
+testpaths = ["tests"]
