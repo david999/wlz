@@ -8,13 +8,34 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
+    # 基础环境从 .env 读取。
     env_file:
       - ../.env
+    environment:
+      # 固化容器内落库到卷目录,保证持久化到 arb-data 卷;
+      # 会覆盖 .env 中的 ARB_DB_PATH(本地运行才用 .env 的值,见 .env.example 说明)。
+      ARB_DB_PATH: /app/data/arb.db
     volumes:
-      # 持久化 SQLite 落库与配置
+      # 只读挂载监控标的配置,便于改配置后重启生效
       - ../arb/config/symbols.yaml:/app/arb/config/symbols.yaml:ro
-      - arb-data:/app
+      # 持久化 SQLite 落库(仅挂载数据目录,不覆盖 /app 源码)
+      - arb-data:/app/data
+    # 健康检查:读取落库新鲜度;用 CMD-SHELL 以展开 $$ARB_DB_PATH,
+    # 使自定义落库路径时探针仍指向正确的库($$ 转义避免被 compose 插值)。
+    healthcheck:
+      test: ["CMD-SHELL", "python -m arb.monitoring.health --db-path \"$$ARB_DB_PATH\" --max-age-ms 30000"]
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+      retries: 3
+    # 异常/宿主重启后自动拉起;手动 stop 不自动重启
     restart: unless-stopped
+    # 日志滚动,避免磁盘被结构化日志占满
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
 
 volumes:
   arb-data:

@@ -3,6 +3,7 @@
 用法:
     python -m arb.main --mode monitor    # 迭代 1:只读价差监控(落库+告警)
     python -m arb.main --mode backtest   # 迭代 2:在录制/CSV 数据上回放策略并输出报告
+    python -m arb.main --mode synthesize # 迭代 4a:拉历史 K 线合成价差样本 CSV(供回测/标定)
     python -m arb.main --mode paper      # 迭代 3:测试网行情驱动的模拟撮合(不下单)
     python -m arb.main --mode live       # 迭代 4:测试网/实盘真实下单(需 ARB_ALLOW_LIVE=true)
     python -m arb.main --mode cross      # 迭代 6:跨交易所价差监控 + 再平衡建议
@@ -159,7 +160,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--mode",
         default=None,
-        choices=["monitor", "backtest", "paper", "live", "cross"],
+        choices=["monitor", "backtest", "synthesize", "paper", "live", "cross"],
         help="运行模式;缺省时用 ARB_MODE / settings.mode",
     )
     return parser.parse_args()
@@ -185,6 +186,41 @@ def _run_backtest(settings: Settings, pairs) -> None:
     print(format_report(report, pair.name))
 
 
+def _run_synthesize(settings: Settings, pairs) -> None:
+    """迭代 4a:用 ccxt 历史 K 线合成 (ts_ms, net_bps) 样本并导出 CSV。
+
+    产出可直接用于 --mode backtest(ARB_BACKTEST_SOURCE=csv)与 arb.optimize 参数标定。
+    ccxt 缺失/无网络时优雅报错并返回,不抛未捕获异常。
+    """
+    from arb.backtest.history import export_to_csv, synthesize_from_exchange
+
+    log = get_logger("synthesize")
+    pair = next((p for p in pairs if p.name == settings.backtest_pair), pairs[0])
+    try:
+        samples = synthesize_from_exchange(
+            exchange_id=settings.exchange,
+            spot_symbol=pair.spot_symbol,
+            perp_symbol=pair.perp_symbol,
+            spot_taker_fee_bps=pair.spot_taker_fee_bps,
+            perp_taker_fee_bps=pair.perp_taker_fee_bps,
+            funding_bps=settings.history_funding_bps,
+            timeframe=settings.history_timeframe,
+            limit=settings.history_limit,
+        )
+    except (RuntimeError, ValueError) as exc:  # ccxt 缺失/无网/交易所不支持
+        log.error("synthesize_failed", pair=pair.name, error=str(exc))
+        return
+    export_to_csv(samples, settings.history_out_csv)
+    log.info(
+        "synthesize_done",
+        pair=pair.name,
+        samples=len(samples),
+        out=settings.history_out_csv,
+        timeframe=settings.history_timeframe,
+    )
+    print(f"已合成 {len(samples)} 条样本 -> {settings.history_out_csv}(pair={pair.name})")
+
+
 def main() -> None:
     args = parse_args()
     settings = Settings()
@@ -195,6 +231,10 @@ def main() -> None:
 
     if mode == "backtest":
         _run_backtest(settings, pairs)
+        return
+
+    if mode == "synthesize":
+        _run_synthesize(settings, pairs)
         return
 
     if mode == "monitor":

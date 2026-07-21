@@ -24,13 +24,20 @@ from arb.execution.live_executor import LiveExecutor
 from arb.execution.models import Position, Side
 from arb.marketdata.spread import compute_spread
 from arb.monitoring.alerts import Alerter, build_alerter
+from arb.monitoring.confirm import ConfirmationSource, build_confirmation_source
 from arb.monitoring.logger import get_logger
 from arb.risk.manager import RiskManager
 from arb.strategy.signal import Action, ZScoreSignalEngine
 
 
 class TradingEngine:
-    def __init__(self, settings: Settings, pairs: list[PairConfig], live: bool) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        pairs: list[PairConfig],
+        live: bool,
+        confirm_source: ConfirmationSource | None = None,
+    ) -> None:
         self.settings = settings
         self.pairs = pairs
         self.live = live
@@ -73,6 +80,17 @@ class TradingEngine:
             initial_equity=settings.total_capital,
         )
         self.alerter: Alerter = build_alerter(settings.telegram_token, settings.telegram_chat_id)
+        # 半自动逐单确认:默认基于告警渠道轮询 Telegram;测试可注入 Fake 确认源
+        self.confirm_source: ConfirmationSource = (
+            confirm_source or build_confirmation_source(self.alerter)
+        )
+        # 待确认开仓的后台任务(pair -> Task):不阻塞评估循环,平仓/kill switch 仍全自动
+        self._pending: dict[str, asyncio.Task] = {}
+        if settings.require_manual_confirm and not getattr(self.alerter, "enabled", False):
+            self.log.warning(
+                "confirm_enabled_but_no_alerter",
+                hint="require_manual_confirm=True 但未配置告警渠道,所有开仓将超时作废",
+            )
         self.alloc = allocator.allocate(
             settings.total_capital, settings.leverage, max(1, len(pairs))
         )
@@ -183,27 +201,16 @@ class TradingEngine:
             if not decision.allow:
                 self.log.info("open_rejected", pair=pair.name, reason=decision.reason)
                 return
-            # 使用 compute_spread 已选定的方向(与 result.spot_price/perp_price 一致)
-            res = await self.executor.open_hedge(
-                pair, result.direction, result.spot_price, result.perp_price, now
-            )
-            if res.ok and res.position is not None:
-                self.positions[pair.name] = res.position
-                # delta 中性校验(非阻断,仅告警):对冲两腿名义严重偏离时提醒
-                dcheck = self.risk.check_position_delta(res.position)
-                if not dcheck.allow:
-                    self.log.warning("delta_deviation", pair=pair.name)
-                    await self._alert(f"⚠️ 仓位 {pair.name} delta 偏离中性超限")
-                self.log.warning(
-                    "OPEN", pair=pair.name, direction=result.direction,
-                    z=round(sig.zscore, 2), net_bps=round(result.net_bps, 2),
-                    note=res.error or "",
+            # 半自动确认闸门:require_manual_confirm=True 时不阻塞评估循环,
+            # 而是起后台任务等待人工确认(平仓/kill switch 仍按周期全自动运行)。
+            if self.settings.require_manual_confirm:
+                if pair.name in self._pending:
+                    return  # 该 pair 已有待确认机会,忽略重复触发
+                self._pending[pair.name] = asyncio.create_task(
+                    self._confirm_then_open(pair, result, sig, now)
                 )
-                await self._alert(
-                    f"🟢 开仓 {pair.name} {result.direction} z={sig.zscore:.2f} net={result.net_bps:.1f}bps"
-                )
-            else:
-                self.log.warning("open_failed", pair=pair.name, error=res.error)
+                return
+            await self._open(pair, result, sig, now)
         elif sig.action == Action.CLOSE and has_pos:
             spot = self.books.get(pair.spot_symbol)
             perp = self.books.get(pair.perp_symbol)
@@ -225,6 +232,73 @@ class TradingEngine:
             if rd.kill:
                 self.log.error("max_drawdown_breached_kill", equity=round(self.risk.equity, 2))
                 await self._alert("⛔ 触发最大回撤熔断,已置 kill switch")
+
+    async def _open(self, pair: PairConfig, result, sig, now: int) -> None:
+        """执行开仓(两腿对冲)并记录仓位/告警。调用前已通过风控与(可选)人工确认。"""
+        # 使用 compute_spread 已选定的方向(与 result.spot_price/perp_price 一致)
+        res = await self.executor.open_hedge(
+            pair, result.direction, result.spot_price, result.perp_price, now
+        )
+        if res.ok and res.position is not None:
+            self.positions[pair.name] = res.position
+            # delta 中性校验(非阻断,仅告警):对冲两腿名义严重偏离时提醒
+            dcheck = self.risk.check_position_delta(res.position)
+            if not dcheck.allow:
+                self.log.warning("delta_deviation", pair=pair.name)
+                await self._alert(f"⚠️ 仓位 {pair.name} delta 偏离中性超限")
+            self.log.warning(
+                "OPEN", pair=pair.name, direction=result.direction,
+                z=round(sig.zscore, 2), net_bps=round(result.net_bps, 2),
+                note=res.error or "",
+            )
+            await self._alert(
+                f"🟢 开仓 {pair.name} {result.direction} z={sig.zscore:.2f} net={result.net_bps:.1f}bps"
+            )
+        else:
+            self.log.warning("open_failed", pair=pair.name, error=res.error)
+
+    async def _confirm_then_open(self, pair: PairConfig, result, sig, now: int) -> None:
+        """后台等待人工确认;确认且未超时则开仓,否则作废。不阻塞评估循环。"""
+        try:
+            if await self._confirm_gate(pair, result, sig):
+                # 再次确认此刻仍空仓(等待期间可能已由其他路径处理)
+                if pair.name not in self.positions:
+                    await self._open(pair, result, sig, now)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 后台任务异常不应影响主循环
+            self.log.warning("confirm_open_error", pair=pair.name, error=str(exc))
+        finally:
+            self._pending.pop(pair.name, None)
+
+    async def _confirm_gate(self, pair: PairConfig, result, sig) -> bool:
+        """开仓前的人工确认闸门(仅开仓)。
+
+        - require_manual_confirm=False:直接放行,保持现有全自动行为(向后兼容)。
+        - True:发告警并进入待确认;收到确认且未超时返回 True,否则作废并记日志。
+        """
+        if not self.settings.require_manual_confirm:
+            return True
+        request_id = f"{pair.name}:{int(time.time() * 1000)}"
+        timeout = self.settings.confirm_timeout_sec
+        self.log.warning(
+            "await_confirm", pair=pair.name, direction=result.direction,
+            request_id=request_id, timeout_sec=timeout,
+        )
+        await self._alert(
+            f"⏳ 待确认开仓 {pair.name} {result.direction} "
+            f"z={sig.zscore:.2f} net={result.net_bps:.1f}bps — "
+            f"回复 confirm 确认(超时 {timeout:.0f}s 作废)id={request_id}"
+        )
+        try:
+            ok = await self.confirm_source.wait_for_confirmation(request_id, timeout)
+        except Exception as exc:  # noqa: BLE001 确认源异常按未确认处理，不开仓
+            self.log.warning("confirm_source_error", pair=pair.name, error=str(exc))
+            ok = False
+        if not ok:
+            self.log.warning("confirm_discarded", pair=pair.name, request_id=request_id)
+            await self._alert(f"🚫 未确认/超时,作废开仓机会 {pair.name} id={request_id}")
+        return ok
 
     async def run(self) -> None:
         if self.live and not self.settings.allow_live:
@@ -253,6 +327,10 @@ class TradingEngine:
 
     async def shutdown(self) -> None:
         self.running = False
+        # 取消所有待确认开仓后台任务(避免悬挂 / 停止后再开仓)
+        for task in list(self._pending.values()):
+            task.cancel()
+        self._pending.clear()
         try:
             await self._close_all("shutdown")
         except Exception:  # noqa: BLE001

@@ -18,6 +18,10 @@ class Alerter(Protocol):
     async def send(self, text: str) -> bool:
         ...
 
+    async def fetch_updates(self, offset: int | None = None) -> list[dict]:
+        """拉取新消息/回调(用于人工确认);未配置或失败时返回空列表。"""
+        ...
+
 
 class NullAlerter:
     """未配置告警渠道时使用:仅返回 False,不做任何网络请求。"""
@@ -26,6 +30,9 @@ class NullAlerter:
 
     async def send(self, text: str) -> bool:  # noqa: ARG002
         return False
+
+    async def fetch_updates(self, offset: int | None = None) -> list[dict]:  # noqa: ARG002
+        return []
 
 
 class TelegramAlerter:
@@ -50,6 +57,26 @@ class TelegramAlerter:
 
     async def send(self, text: str) -> bool:
         return await asyncio.to_thread(self._post, text)
+
+    def _get_updates(self, offset: int | None) -> list[dict]:
+        params: dict = {"timeout": 0}
+        if offset is not None:
+            params["offset"] = offset
+        url = (
+            f"https://api.telegram.org/bot{self.token}/getUpdates?"
+            + urllib.parse.urlencode(params)
+        )
+        try:
+            with urllib.request.urlopen(url, timeout=self.timeout) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+                if body.get("ok"):
+                    return list(body.get("result") or [])
+        except Exception:  # noqa: BLE001 拉取失败不影响主流程
+            return []
+        return []
+
+    async def fetch_updates(self, offset: int | None = None) -> list[dict]:
+        return await asyncio.to_thread(self._get_updates, offset)
 
 
 def build_alerter(token: str | None, chat_id: str | None) -> Alerter:

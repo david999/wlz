@@ -60,6 +60,10 @@ class Settings(BaseSettings):
     # ---- 安全开关 ----
     allow_live: bool = False          # 必须显式置 true 才允许 live 真实下单
 
+    # ---- 半自动逐单确认(仅约束开仓;平仓与 kill switch 仍全自动) ----
+    require_manual_confirm: bool = False   # true 时开仓前需人工在 Telegram 确认
+    confirm_timeout_sec: float = 300.0     # 待确认超时(秒),超时未确认则作废该机会
+
     # ---- 告警(Telegram,可选) ----
     telegram_token: str | None = None
     telegram_chat_id: str | None = None
@@ -68,6 +72,12 @@ class Settings(BaseSettings):
     backtest_source: str = "db"       # db | csv
     backtest_csv_path: str | None = None
     backtest_pair: str | None = None  # 仅回测指定 pair(None=第一个)
+
+    # ---- 历史样本合成(synthesize 模式,供回测/标定) ----
+    history_timeframe: str = "1h"     # ccxt K 线周期(1m/5m/1h/1d 等)
+    history_limit: int = 500          # 每腿拉取的 K 线根数上限
+    history_funding_bps: float = 0.0  # 合成时叠加的方向化资金费(bps)
+    history_out_csv: str = "history_samples.csv"  # 输出 CSV 路径(与 load_from_csv 兼容)
 
 
 def load_symbols(path: str) -> SymbolsConfig:
